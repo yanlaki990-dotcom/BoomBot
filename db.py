@@ -9,23 +9,25 @@ DB_PATH = os.path.join(DATA_DIR, "bot.db")
 
 
 def _convert_dates(row):
-    """Вспомогательная функция для преобразования строковых дат SQLite в datetime"""
+    """Преобразует строковые даты из SQLite в объекты datetime с часовым поясом UTC"""
     if row is None:
         return None
     d = dict(row)
-    for field in ["first_seen", "started_at", "expires_at", "created_at"]:
+    for field in ["first_seen", "started_at", "expires_at", "created_at", "banned_at"]:
         if field in d and d[field]:
             try:
-                d[field] = datetime.fromisoformat(d[field])
+                dt = datetime.fromisoformat(d[field])
+                # Если дата без часового пояса (naive), принудительно ставим UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                d[field] = dt
             except (ValueError, TypeError):
                 pass
     return d
 
 
 async def init():
-    # Создаём папку, если её нет
     os.makedirs(DATA_DIR, exist_ok=True)
-
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -49,6 +51,11 @@ async def init():
                 plan TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS banned_users (
+                tg_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                banned_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
         await db.commit()
 
@@ -69,6 +76,16 @@ async def get_user(tg_id: int):
         async with db.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)) as cur:
             row = await cur.fetchone()
             return _convert_dates(row)
+
+
+async def set_vendor_credentials(tg_id: int, username: str, password: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO users (tg_id, vendor_username, password) VALUES (?, ?, ?) "
+            "ON CONFLICT(tg_id) DO UPDATE SET vendor_username=excluded.vendor_username, password=excluded.password",
+            (tg_id, username, password)
+        )
+        await db.commit()
 
 
 async def get_active_subscription(tg_id: int):
@@ -100,7 +117,7 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
             current = _convert_dates(current_row)
 
         if current and current["expires_at"] is None:
-            return current  # уже навсегда
+            return current
 
         if days is None:
             expires_at = None
@@ -108,9 +125,6 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
             base = now
             if current and current["expires_at"]:
                 cur_exp = current["expires_at"]
-                # Если дата из базы пришла без таймзоны, добавляем UTC
-                if cur_exp.tzinfo is None:
-                    cur_exp = cur_exp.replace(tzinfo=timezone.utc)
                 if cur_exp > now:
                     base = cur_exp
             expires_at = (base + timedelta(days=days)).isoformat()
@@ -142,7 +156,7 @@ async def stats():
             "WHERE expires_at IS NULL OR expires_at > datetime('now')"
         ) as cur:
             active = (await cur.fetchone())[0]
-    return users, active, 0, 0  # 0,0 — заглушка для старых ключей
+    return users, active, 0, 0
 
 
 async def set_pending(tg_id: int, plan: str):
@@ -167,3 +181,35 @@ async def clear_pending(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM pending_vendor WHERE tg_id=?", (tg_id,))
         await db.commit()
+
+
+async def is_banned(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT tg_id FROM banned_users WHERE tg_id=?", (tg_id,)) as cur:
+            return await cur.fetchone() is not None
+
+
+async def ban_user(tg_id: int, reason: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO banned_users (tg_id, reason) VALUES (?, ?) "
+            "ON CONFLICT(tg_id) DO UPDATE SET reason=excluded.reason, banned_at=datetime('now')",
+            (tg_id, reason)
+        )
+        await db.execute("DELETE FROM subscriptions WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM pending_vendor WHERE tg_id=?", (tg_id,))
+        await db.commit()
+
+
+async def unban_user(tg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM banned_users WHERE tg_id=?", (tg_id,))
+        await db.commit()
+
+
+async def get_banned_list():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM banned_users ORDER BY banned_at DESC LIMIT 30") as cur:
+            rows = await cur.fetchall()
+            return [_convert_dates(r) for r in rows]
