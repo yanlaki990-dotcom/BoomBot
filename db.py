@@ -1,14 +1,30 @@
-import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 import aiosqlite
 import config
 
-DB_PATH = "/app/data/bot.db"  # путь внутри контейнера Bothost
+# База будет создаваться в папке /app/data, которую мы настроили в Dockerfile
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+DB_PATH = os.path.join(DATA_DIR, "bot.db")
+
+
+def _convert_dates(row):
+    """Вспомогательная функция для преобразования строковых дат SQLite в datetime"""
+    if row is None:
+        return None
+    d = dict(row)
+    for field in ["first_seen", "started_at", "expires_at", "created_at"]:
+        if field in d and d[field]:
+            try:
+                d[field] = datetime.fromisoformat(d[field])
+            except (ValueError, TypeError):
+                pass
+    return d
+
 
 async def init():
-    # Создаём папку /app/data, если её нет (Bothost её и так создаёт, но на всякий случай)
-    import os
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    # Создаём папку, если её нет
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -36,6 +52,7 @@ async def init():
         """)
         await db.commit()
 
+
 async def upsert_user(tg_id: int, username: str | None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -45,11 +62,14 @@ async def upsert_user(tg_id: int, username: str | None):
         )
         await db.commit()
 
+
 async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)) as cur:
-            return await cur.fetchone()
+            row = await cur.fetchone()
+            return _convert_dates(row)
+
 
 async def get_active_subscription(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -60,7 +80,9 @@ async def get_active_subscription(tg_id: int):
             "ORDER BY (expires_at IS NULL) DESC, expires_at DESC LIMIT 1",
             (tg_id,)
         ) as cur:
-            return await cur.fetchone()
+            row = await cur.fetchone()
+            return _convert_dates(row)
+
 
 async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
     name, days, _paid = config.PLANS[plan]
@@ -74,7 +96,8 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
             "ORDER BY (expires_at IS NULL) DESC, expires_at DESC LIMIT 1",
             (tg_id,)
         ) as cur:
-            current = await cur.fetchone()
+            current_row = await cur.fetchone()
+            current = _convert_dates(current_row)
 
         if current and current["expires_at"] is None:
             return current  # уже навсегда
@@ -84,7 +107,10 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
         else:
             base = now
             if current and current["expires_at"]:
-                cur_exp = datetime.fromisoformat(current["expires_at"])
+                cur_exp = current["expires_at"]
+                # Если дата из базы пришла без таймзоны, добавляем UTC
+                if cur_exp.tzinfo is None:
+                    cur_exp = cur_exp.replace(tzinfo=timezone.utc)
                 if cur_exp > now:
                     base = cur_exp
             expires_at = (base + timedelta(days=days)).isoformat()
@@ -96,13 +122,16 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "manual"):
         await db.commit()
 
         async with db.execute("SELECT * FROM subscriptions WHERE id = last_insert_rowid()") as cur:
-            return await cur.fetchone()
+            row = await cur.fetchone()
+            return _convert_dates(row)
+
 
 async def get_all_tg_ids():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT tg_id FROM users") as cur:
             rows = await cur.fetchall()
         return [r[0] for r in rows]
+
 
 async def stats():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -113,7 +142,8 @@ async def stats():
             "WHERE expires_at IS NULL OR expires_at > datetime('now')"
         ) as cur:
             active = (await cur.fetchone())[0]
-    return users, active, 0, 0  # ключей и промо больше нет
+    return users, active, 0, 0  # 0,0 — заглушка для старых ключей
+
 
 async def set_pending(tg_id: int, plan: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -124,11 +154,14 @@ async def set_pending(tg_id: int, plan: str):
         )
         await db.commit()
 
+
 async def get_pending(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM pending_vendor WHERE tg_id=?", (tg_id,)) as cur:
-            return await cur.fetchone()
+            row = await cur.fetchone()
+            return _convert_dates(row)
+
 
 async def clear_pending(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
