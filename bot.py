@@ -20,10 +20,14 @@ class BanMiddleware(BaseMiddleware):
         if user_id in config.ADMIN_IDS:
             return await handler(event, data)
         try:
-            async with db.pool.acquire() as con:
-                row = await con.fetchrow("SELECT tg_id FROM banned_users WHERE tg_id=$1", user_id)
-                if row is not None:
-                    return
+            async with aiosqlite_connect() as con: # Заглушка, мы не используем asyncpg
+                pass
+        except Exception:
+            pass
+        # Проверка бана через функцию в db.py
+        try:
+            if await db.is_banned(user_id):
+                return
         except Exception as e:
             log.error(f"ban check {user_id}: {e}")
         return await handler(event, data)
@@ -42,11 +46,14 @@ class SubscriptionMiddleware(BaseMiddleware):
                 is_sub = True
         except Exception as e:
             log.error(f"sub {user_id}: {e}")
+        
         if is_sub:
             return await handler(event, data)
+            
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             await event.answer("❌ Ты ещё не подписан!", show_alert=True)
             return
+            
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Подписаться", url=config.CHANNEL_URL)],
             [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
@@ -83,33 +90,11 @@ def channel_keyboard():
 
 # ============ HELPERS ============
 def fmt_dt(dt: datetime) -> str:
+    if not dt: return "неизвестно"
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in config.ADMIN_IDS
-
-def _mask_db_url(url: str) -> str:
-    if not url:
-        return "(пусто)"
-    try:
-        if "://" in url and "@" in url:
-            proto, rest = url.split("://", 1)
-            userpass, hostpart = rest.split("@", 1)
-            if ":" in userpass:
-                user, _ = userpass.split(":", 1)
-                return f"{proto}://{user}:***@{hostpart}"
-            return f"{proto}://{userpass}@{hostpart}"
-        return url
-    except Exception:
-        return url
-
-async def is_banned(tg_id: int) -> bool:
-    try:
-        async with db.pool.acquire() as con:
-            row = await con.fetchrow("SELECT tg_id FROM banned_users WHERE tg_id=$1", tg_id)
-            return row is not None
-    except Exception:
-        return False
 
 async def sub_status_text(tg_id: int) -> str:
     sub = await db.get_active_subscription(tg_id)
@@ -125,26 +110,12 @@ async def create_vendor_account(message: Message, username: str, password: str, 
     tg = message.from_user.id
     log.info(f"[save] START tg={tg} user={username} pass_len={len(password)}")
 
-    if await is_banned(tg):
+    if await db.is_banned(tg):
         log.warning(f"[save] BANNED tg={tg} — отклонено")
         return False
 
     try:
-        async with db.pool.acquire() as con:
-            result = await con.execute(
-                "INSERT INTO public.users (tg_id, username, vendor_username, password) "
-                "VALUES ($1, NULL, $2, $3) "
-                "ON CONFLICT (tg_id) DO UPDATE SET "
-                "vendor_username = EXCLUDED.vendor_username, "
-                "password = EXCLUDED.password",
-                tg, username, password
-            )
-            log.info(f"[save] SQL result={result}")
-            row = await con.fetchrow(
-                "SELECT tg_id, vendor_username, password FROM public.users WHERE tg_id=$1",
-                tg
-            )
-            log.info(f"[save] AFTER row={dict(row) if row else None}")
+        await db.set_vendor_credentials(tg, username, password)
     except Exception as e:
         log.error(f"[save] FAILED tg={tg}: {e}")
         await message.answer(f"❌ Ошибка сохранения: {e}")
@@ -179,15 +150,7 @@ async def cmd_ban(message: Message):
     target_id = int(parts[1])
     reason = parts[2] if len(parts) > 2 else "(без причины)"
     try:
-        async with db.pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO banned_users (tg_id, reason) VALUES ($1, $2) "
-                "ON CONFLICT (tg_id) DO UPDATE SET reason = EXCLUDED.reason, banned_at = NOW()",
-                target_id, reason
-            )
-            await con.execute("DELETE FROM subscriptions WHERE tg_id=$1", target_id)
-            await con.execute("DELETE FROM pending_vendor WHERE tg_id=$1", target_id)
-            await con.execute("DELETE FROM public.users WHERE tg_id=$1", target_id)
+        await db.ban_user(target_id, reason)
         await message.answer(f"✅ Забанен <code>{target_id}</code>\n📝 {reason}")
     except Exception as e:
         log.error(f"ban failed: {e}")
@@ -203,9 +166,8 @@ async def cmd_unban(message: Message):
         return
     target_id = int(parts[1])
     try:
-        async with db.pool.acquire() as con:
-            result = await con.execute("DELETE FROM banned_users WHERE tg_id=$1", target_id)
-        await message.answer(f"✅ Разбанен <code>{target_id}</code> ({result})")
+        await db.unban_user(target_id)
+        await message.answer(f"✅ Разбанен <code>{target_id}</code>")
     except Exception as e:
         log.error(f"unban failed: {e}")
         await message.answer(f"❌ Ошибка: <code>{e}</code>")
@@ -215,53 +177,18 @@ async def cmd_banned(message: Message):
     if not is_admin(message.from_user.id):
         return
     try:
-        async with db.pool.acquire() as con:
-            rows = await con.fetch(
-                "SELECT tg_id, reason, banned_at FROM banned_users ORDER BY banned_at DESC LIMIT 30"
-            )
+        rows = await db.get_banned_list()
         if not rows:
             await message.answer("📭 Чёрный список пуст")
             return
         lines = [f"<b>🚫 Чёрный список ({len(rows)}):</b>", ""]
         for r in rows:
-            ts = r["banned_at"].strftime("%d.%m %H:%M") if r["banned_at"] else "?"
+            ts = fmt_dt(r["banned_at"])
             lines.append(f"<code>{r['tg_id']}</code> — {r['reason']} <i>({ts})</i>")
         await message.answer("\n".join(lines))
     except Exception as e:
         log.error(f"banned list failed: {e}")
         await message.answer(f"❌ Ошибка: <code>{e}</code>")
-
-@router.message(Command("dbcheck"))
-async def cmd_dbcheck(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        masked = _mask_db_url(config.DATABASE_URL)
-        async with db.pool.acquire() as con:
-            total = await con.fetchval("SELECT count(*) FROM public.users")
-            rows = await con.fetch(
-                "SELECT tg_id, username, vendor_username, password, first_seen "
-                "FROM public.users ORDER BY first_seen DESC LIMIT 5"
-            )
-        lines = [
-            f"<b>DB URL:</b> <code>{masked}</code>",
-            f"<b>Users count:</b> {total}",
-            "",
-            "<b>Last 5:</b>",
-        ]
-        for i, r in enumerate(rows, 1):
-            ts = r["first_seen"].strftime("%d.%m %H:%M") if r["first_seen"] else "?"
-            lines.append(
-                f"{i}. tg_id=<code>{r['tg_id']}</code>, "
-                f"user=<code>{r['username']}</code>, "
-                f"vuser=<code>{r['vendor_username']}</code>, "
-                f"pass=<code>{r['password']}</code>, "
-                f"seen={ts}"
-            )
-        await message.answer("\n".join(lines))
-    except Exception as e:
-        log.error(f"dbcheck failed: {e}")
-        await message.answer(f"❌ dbcheck error: <code>{e}</code>")
 
 # ============ USER HANDLERS ============
 @router.callback_query(F.data == "check_sub")
@@ -278,10 +205,12 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await db.upsert_user(message.from_user.id, message.from_user.username)
     user = await db.get_user(message.from_user.id)
+    
     if user and user["first_seen"] and (datetime.now(timezone.utc) - user["first_seen"]).total_seconds() > 60:
         text = "С возвращением! Вы вошли в аккаунт."
     else:
         text = "👋 Добро пожаловать в <b>BoomDLC</b>!"
+        
     await message.answer(text, reply_markup=main_menu())
     await message.answer("📥 <b>Скачать клиент:</b>", reply_markup=loader_keyboard())
 
@@ -332,11 +261,13 @@ async def give_sub(message: Message):
         return
     target_id = int(parts[1])
     plan = parts[2]
+    
     await db.upsert_user(target_id, None)
     await db.grant_subscription(target_id, plan, source="manual")
 
     user = await db.get_user(target_id)
     vendor_username = user["vendor_username"] if user else None
+    
     if not vendor_username:
         await db.set_pending(target_id, plan)
         try:
@@ -356,7 +287,7 @@ async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
     u, a, kf, ku = await db.stats()
-    await message.answer(f"📊 Юзеров: {u}\nАктивных: {a}\nСвободно: {kf}\nЮзано: {ku}")
+    await message.answer(f"📊 Юзеров: {u}\nАктивных: {a}")
 
 @router.message(Command("post"))
 async def cmd_post(message: Message):
@@ -407,18 +338,6 @@ async def process_pending_vendor(message: Message):
 # ============ STARTUP ============
 async def on_startup():
     await db.init()
-    try:
-        async with db.pool.acquire() as con:
-            await con.execute("""
-                CREATE TABLE IF NOT EXISTS banned_users (
-                    tg_id BIGINT PRIMARY KEY,
-                    reason TEXT,
-                    banned_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-        log.info("banned_users table OK")
-    except Exception as e:
-        log.error(f"banned_users create failed: {e}")
     log.info("DB ok")
 
 async def main():
